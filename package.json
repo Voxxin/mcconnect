@@ -1,0 +1,41 @@
+{
+  "name": "mcconnect",
+  "version": "1.0.0",
+  "description": "Lightweight protocol-level Minecraft server implementation for Node.js with authentication, encryption, and ping/status support.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node test/script.js"
+  },
+  "keywords": [
+    "minecraft",
+    "minecraft-protocol",
+    "protocol",
+    "ping",
+    "status",
+    "authentication",
+    "encryption",
+    "mojang",
+    "nodejs"
+  ],
+  "author": "ella",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Voxxin/mcconnect.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ella/mccVoxxinonnect/issues"
+  },
+  "homepage": "https://github.com/ella/Voxxin#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
