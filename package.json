@@ -11,9 +11,6 @@
     "index.js",
     "README.md"
   ],
-  "scripts": {
-    "test": "node test/script.js"
-  },
   "keywords": [
     "minecraft",
     "minecraft-protocol",
