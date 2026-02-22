@@ -17,8 +17,7 @@ class VarInt {
    * @throws {Error} If VarInt exceeds maximum size (5 bytes)
    */
   static read(buffer, offset = 0) {
-    let result = 0,
-      shift = 0;
+    let result = 0, shift = 0;
     do {
       const byteValue = buffer[offset + shift];
       result |= (byteValue & 0x7f) << (7 * shift++);
@@ -97,6 +96,48 @@ class PacketParser {
   static writeByteArray(data) {
     return Buffer.concat([VarInt.write(data.length), data]);
   }
+
+  /**
+   * Writes a UUID in Minecraft format (two longs)
+   * @param {string} uuid - UUID string (with or without dashes)
+   * @returns {Buffer} 16-byte UUID buffer
+   */
+  static writeUUID(uuid) {
+    // Remove dashes from UUID
+    const hex = uuid.replace(/-/g, "");
+    // Convert to buffer (16 bytes)
+    return Buffer.from(hex, "hex");
+  }
+
+  /**
+   * Writes a Game Profile (UUID + Name + Properties)
+   * @param {Object} profile - Game profile object
+   * @returns {Buffer} Encoded game profile
+   */
+  static writeGameProfile(profile) {
+    const parts = [
+      PacketParser.writeUUID(profile.id), // UUID
+      PacketParser.writeString(profile.name), // Name
+      VarInt.write(profile.properties ? profile.properties.length : 0), // Properties count
+    ];
+
+    // Add properties if they exist
+    if (profile.properties && profile.properties.length > 0) {
+      for (const prop of profile.properties) {
+        parts.push(PacketParser.writeString(prop.name));
+        parts.push(PacketParser.writeString(prop.value));
+        // Is Signed (boolean)
+        if (prop.signature) {
+          parts.push(Buffer.from([0x01])); // true
+          parts.push(PacketParser.writeString(prop.signature));
+        } else {
+          parts.push(Buffer.from([0x00])); // false
+        }
+      }
+    }
+
+    return Buffer.concat(parts);
+  }
 }
 
 /**
@@ -112,7 +153,7 @@ class Connection {
   constructor(socket) {
     this.socket = socket; // TCP socket
     this.buffer = Buffer.alloc(0); // Accumulated buffer
-    this.state = "handshake"; // Connection state: 'handshake' | 'status' | 'login'
+    this.state = "handshake"; // Connection state: 'handshake' | 'status' | 'login' | 'configuration'
     this.protocolVersion = 0; // Protocol version
     this.verificationToken = null; // Verification token
     this.sharedSecret = null; // Shared secret for encryption
@@ -120,6 +161,7 @@ class Connection {
     this.gameProfile = null; // Game profile (after authentication)
     this.cipher = null; // Cipher for outgoing data
     this.decipher = null; // Decipher for incoming data
+    this.redirectTarget = null; // Redirect target (if any)
   }
 
   /**
@@ -163,6 +205,7 @@ class Connection {
  * - Customizable MOTD and ping responses
  * - Player authentication with Mojang sessions
  * - Encryption support
+ * - Server redirection support
  * - Clean disconnect handling
  *
  * @class MCConnect
@@ -177,10 +220,10 @@ class Connection {
  *     favicon: "data:image/png;base64,..."
  *   }))
  *   .onPing((payload, protocolVersion) => 'online')
- *   .onConnect((profile, protocolVersion) => {
- *     console.log(`${profile.name} (${profile.id}) attempted to connect`);
- *     return "§cServer is currently closed for maintenance";
- *   });
+ *   .onRedirect((profile, protocolVersion) => ({
+ *     host: "play.example.com",
+ *     port: 25565
+ *   }));
  */
 export default class MCConnect {
   /**
@@ -203,6 +246,7 @@ export default class MCConnect {
     // Event handlers (initially null)
     this.#motdHandler = null; // MOTD (status) handler
     this.#connectHandler = null; // Connection handler
+    this.#redirectHandler = null; // Redirect handler
     this.#pingMode = "online"; // Default ping mode
     this.#pingHandler = null; // Custom ping handler
   }
@@ -212,6 +256,7 @@ export default class MCConnect {
   #server;
   #motdHandler;
   #connectHandler;
+  #redirectHandler;
   #pingMode;
   #pingHandler;
 
@@ -261,6 +306,26 @@ export default class MCConnect {
   }
 
   /**
+   * @callback RedirectHandler
+   * @param {Object} gameProfile - Authenticated player profile from Mojang
+   * @param {string} gameProfile.id - Player's unique Mojang ID (UUID)
+   * @param {string} gameProfile.name - Player's username
+   * @param {Object[]} [gameProfile.properties] - Additional player properties (textures, etc.)
+   * @param {number} protocolVersion - The Minecraft protocol version number
+   * @returns {{host: string, port: number}|null|undefined} Server address to redirect to, or null/undefined to use onConnect handler
+   */
+
+  /**
+   * Sets the player redirect handler (transfers player to another server instead of disconnecting)
+   * @param {RedirectHandler} handler - Function receiving game profile and protocol version, returns {host, port} or null
+   * @returns {MCConnect} Returns self for chaining
+   */
+  onRedirect(handler) {
+    this.#redirectHandler = handler;
+    return this;
+  }
+
+  /**
    * Sets the ping response mode
    * @param {"online"|"pinging"} mode - 'online' (immediate response) or 'pinging' (delayed response, 3-5s)
    * @returns {MCConnect} Returns self for chaining
@@ -292,7 +357,7 @@ export default class MCConnect {
 
   /**
    * Closes the server and stops listening for connections
-   * @returns {Promise<void>} Promise that resolves when server is closed
+   * @returns {Promise} Promise that resolves when server is closed
    */
   close() {
     return new Promise((resolve) => {
@@ -308,10 +373,12 @@ export default class MCConnect {
    */
   #handleConnection(socket) {
     const connection = new Connection(socket);
+
     socket.on("data", async (data) => {
       connection.append(data);
       await this.#process(connection);
     });
+
     socket.on("error", (error) => {
       // Suppress common connection reset errors
       if (
@@ -332,6 +399,7 @@ export default class MCConnect {
       try {
         const { done, packet } = this.#parse(connection);
         if (!done) break;
+
         await this.#handle(packet, connection);
         connection.consume(packet.totalSize);
       } catch (error) {
@@ -349,11 +417,15 @@ export default class MCConnect {
    */
   #parse(connection) {
     if (connection.buffer.length < 1) return { done: false };
+
     const { v: length, s: lengthSize } = VarInt.read(connection.buffer, 0); // Read packet length
     const totalSize = lengthSize + length; // Total packet size
+
     if (connection.buffer.length < totalSize) throw new Error("Incomplete");
+
     const packetData = connection.buffer.slice(lengthSize, totalSize); // Packet data (without length)
     const { v: packetId } = VarInt.read(packetData, 0); // Packet ID
+
     return {
       done: true,
       packet: { id: packetId, length, data: packetData, totalSize },
@@ -375,6 +447,9 @@ export default class MCConnect {
       case "login":
         await this.#login(packet, connection);
         break;
+      case "configuration":
+        await this.#configuration(packet, connection);
+        break;
     }
   }
 
@@ -384,6 +459,7 @@ export default class MCConnect {
    */
   async #handshake(packet, connection) {
     if (packet.id !== 0x00) return; // Only accept handshake packet
+
     const handshake = this.#parseHandshake(packet.data);
     connection.protocolVersion = handshake.protocolVersion; // Store protocol version
 
@@ -393,6 +469,7 @@ export default class MCConnect {
         connection.state = "status";
         break; // Status request
       case 2:
+      case 3: // Transfer intent (treated same as login)
         connection.state = "login";
         break; // Login request
       default:
@@ -412,7 +489,8 @@ export default class MCConnect {
     offset += serverAddress.s;
     const serverPort = buffer.readUInt16BE(offset); // Server port
     offset += 2;
-    const nextState = VarInt.read(buffer, offset); // Next state (1=status, 2=login)
+    const nextState = VarInt.read(buffer, offset); // Next state (1=status, 2=login, 3=transfer)
+
     return {
       protocolVersion: protocolVersion.v,
       serverAddress: serverAddress.v,
@@ -515,6 +593,7 @@ export default class MCConnect {
     while (i < string.length) {
       if (string[i] === "§" && i + 1 < string.length) {
         const code = string[i + 1].toLowerCase();
+
         if (current.text) parts.push(current);
 
         if (code === "r") {
@@ -538,12 +617,14 @@ export default class MCConnect {
             e: "yellow",
             f: "white",
           };
+
           if (colorMap[code]) {
             current = { text: "", color: colorMap[code] };
           } else {
             current = { text: "" }; // Formatting codes not supported
           }
         }
+
         i += 2;
       } else {
         current.text += string[i];
@@ -565,11 +646,14 @@ export default class MCConnect {
     if (typeof component === "string") {
       return (component.match(/\n/g) || []).length;
     }
+
     let count = 0;
     if (component.text) count += (component.text.match(/\n/g) || []).length;
+
     if (Array.isArray(component.extra)) {
       for (const item of component.extra) count += this.#countNewlines(item);
     }
+
     return count;
   }
 
@@ -585,16 +669,20 @@ export default class MCConnect {
         ? component
         : `${parts[0]}\n${parts.slice(1).join(" ")}`;
     }
+
     const result = { ...component };
+
     if (result.text) {
       result.text = this.#limitNewlines(result.text, allowFirst);
       if (result.text.includes("\n")) allowFirst = false;
     }
+
     if (Array.isArray(result.extra)) {
       result.extra = result.extra.map((item) =>
         this.#limitNewlines(item, allowFirst)
       );
     }
+
     return result;
   }
 
@@ -653,6 +741,7 @@ export default class MCConnect {
     if (packet.id === 0x00) await this.#loginStart(packet.data, connection); // Login start
     else if (packet.id === 0x01)
       await this.#encryptionResponse(packet.data, connection); // Encryption response
+    else if (packet.id === 0x03) await this.#loginAcknowledged(connection); // Login acknowledged
   }
 
   /**
@@ -673,6 +762,7 @@ export default class MCConnect {
     connection.verificationToken = crypto.randomBytes(4); // 4-byte verification token
 
     let packet;
+
     // Different packet format for newer protocol versions
     if (connection.protocolVersion > 763) {
       packet = Buffer.concat([
@@ -692,6 +782,7 @@ export default class MCConnect {
         connection.verificationToken,
       ]);
     }
+
     this.#send(connection, packet);
   }
 
@@ -703,7 +794,10 @@ export default class MCConnect {
     const response = this.#parseEncryptionResponse(buffer);
 
     // Verify token matches
-    if (response.decryptedToken.length > 0 && !response.decryptedToken.equals(connection.verificationToken)) {
+    if (
+      response.decryptedToken.length > 0 &&
+      !response.decryptedToken.equals(connection.verificationToken)
+    ) {
       this.#disconnect(connection, "Bad token");
       return;
     }
@@ -713,19 +807,105 @@ export default class MCConnect {
 
     try {
       // Authenticate with Mojang session server
-      connection.gameProfile = await this.#authenticate(connection.username, serverHash);
+      connection.gameProfile = await this.#authenticate(
+        connection.username,
+        serverHash
+      );
       this.#enableEncryption(connection); // Enable encryption
 
-      // Call connection handler for custom disconnect message
+      // Check if we should redirect
+      if (this.#redirectHandler) {
+        try {
+          const redirectResult = this.#redirectHandler(
+            connection.gameProfile,
+            connection.protocolVersion
+          );
+
+          if (
+            redirectResult &&
+            redirectResult.host &&
+            typeof redirectResult.port === "number"
+          ) {
+            // Store redirect target
+            connection.redirectTarget = redirectResult;
+            // Send Login Success
+            this.#sendLoginSuccess(connection);
+            return;
+          }
+        } catch (error) {
+          console.error("Redirect handler error:", error);
+        }
+      }
+
+      // If no redirect, use connect handler for disconnect message
       let message = "Disconnected.";
       if (this.#connectHandler) {
-        const handlerResult = this.#connectHandler(connection.gameProfile, connection.protocolVersion);
-        if (handlerResult !== undefined && handlerResult !== null) message = handlerResult;
+        const handlerResult = this.#connectHandler(
+          connection.gameProfile,
+          connection.protocolVersion
+        );
+        if (handlerResult !== undefined && handlerResult !== null)
+          message = handlerResult;
       }
+
       this.#disconnect(connection, message);
     } catch (error) {
       this.#disconnect(connection, "Authentication failed");
     }
+  }
+
+  /**
+   * Sends Login Success packet
+   * @private
+   */
+  #sendLoginSuccess(connection) {
+    const packet = Buffer.concat([
+      VarInt.write(0x02), // Login Success packet ID
+      PacketParser.writeGameProfile(connection.gameProfile),
+      // Buffer.from([0x00]), // Strict error handling flag (false)
+    ]);
+
+    this.#send(connection, packet);
+  }
+
+  /**
+   * Handles Login Acknowledged packet from client
+   * @private
+   */
+  async #loginAcknowledged(connection) {
+    // Switch to configuration state
+    connection.state = "configuration";
+
+    // If we have a redirect target, send the transfer packet
+    if (connection.redirectTarget) {
+      this.#sendTransfer(connection);
+    }
+  }
+
+  /**
+   * Handles configuration phase packets
+   * @private
+   */
+  async #configuration(packet, connection) {
+    // We don't need to handle any configuration packets
+    // Just waiting for disconnect after transfer
+  }
+
+  /**
+   * Sends Transfer packet to redirect client to another server
+   * @private
+   */
+  #sendTransfer(connection) {
+    const packet = Buffer.concat([
+      VarInt.write(0x0b), // Transfer packet ID
+      PacketParser.writeString(connection.redirectTarget.host),
+      VarInt.write(connection.redirectTarget.port),
+    ]);
+
+    this.#send(connection, packet);
+
+    // Close connection after brief delay
+    setTimeout(() => connection.socket.end(), 100);
   }
 
   /**
@@ -755,7 +935,8 @@ export default class MCConnect {
 
     return {
       decryptedSecret: decrypt(encryptedSecret.v),
-      decryptedToken: encryptedToken.length > 0 ? decrypt(encryptedToken) : encryptedToken,
+      decryptedToken:
+        encryptedToken.length > 0 ? decrypt(encryptedToken) : encryptedToken,
     };
   }
 
@@ -768,6 +949,7 @@ export default class MCConnect {
     hash.update(Buffer.alloc(0)); // Server ID (empty for offline mode)
     hash.update(sharedSecret); // Shared secret
     hash.update(this.#keys.publicKey); // Server public key
+
     const hex = hash.digest("hex");
 
     // Convert to signed hex (Minecraft-specific format)
@@ -787,7 +969,9 @@ export default class MCConnect {
         username
       )}&serverId=${serverHash}`
     );
+
     if (!response.ok) throw new Error(`Mojang API failure: ${response.status}`);
+
     return response.json();
   }
 
@@ -797,8 +981,16 @@ export default class MCConnect {
    */
   #enableEncryption(connection) {
     // Use shared secret as both key and IV for AES-128-CFB8
-    connection.cipher = crypto.createCipheriv("aes-128-cfb8", connection.sharedSecret, connection.sharedSecret);
-    connection.decipher = crypto.createDecipheriv("aes-128-cfb8", connection.sharedSecret, connection.sharedSecret);
+    connection.cipher = crypto.createCipheriv(
+      "aes-128-cfb8",
+      connection.sharedSecret,
+      connection.sharedSecret
+    );
+    connection.decipher = crypto.createDecipheriv(
+      "aes-128-cfb8",
+      connection.sharedSecret,
+      connection.sharedSecret
+    );
   }
 
   /**
@@ -818,11 +1010,13 @@ export default class MCConnect {
     // Normalize disconnect message
     const normalizedReason = this.#normalizeDescription(reason);
     const reasonBuffer = Buffer.from(JSON.stringify(normalizedReason), "utf8");
+
     const packet = Buffer.concat([
       VarInt.write(0x00),
       VarInt.write(reasonBuffer.length),
       reasonBuffer,
     ]);
+
     this.#send(connection, packet);
 
     // Close connection after brief delay
