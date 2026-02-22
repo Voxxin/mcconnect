@@ -1,6 +1,6 @@
 {
   "name": "mcconnect",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Lightweight protocol-level Minecraft server implementation for Node.js with authentication, encryption, and ping/status support.",
   "type": "module",
   "main": "index.js",
