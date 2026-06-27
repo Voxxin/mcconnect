@@ -1,5 +1,5 @@
 {
-  "name": "mcconnect",
+  "name": "@voxxin/mcconnect",
   "version": "1.0.6",
   "description": "Lightweight protocol-level Minecraft server implementation for Node.js with authentication, encryption, and ping/status support.",
   "type": "module",
@@ -37,5 +37,8 @@
   "homepage": "https://github.com/Voxxin/mcconnect#readme",
   "engines": {
     "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
   }
 }
