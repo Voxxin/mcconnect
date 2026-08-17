@@ -99,6 +99,7 @@ class Connection {
     this.buffer = Buffer.alloc(0);
     this.state = "handshake"; // handshake | status | login | configuration
     this.protocolVersion = 0;
+    this.serverAddress = '';
     this.verificationToken = null;
     this.sharedSecret = null;
     this.username = null;
@@ -180,7 +181,7 @@ export default class MCConnect {
   /**
    * Called after successful Mojang authentication. Return a text component
    * to disconnect the client with a custom message.
-   * @param {(profile: object, protocolVersion: number) => object|string|null} handler
+   * @param {(profile: object, protocolVersion: number, serverAddress: string) => object|string|null} handler
    * @returns {this}
    */
   onConnect(handler) {
@@ -192,7 +193,7 @@ export default class MCConnect {
    * Called after authentication. Return `{ host, port }` to transfer the
    * client to another server (requires client protocol 766+), or `null`
    * to fall through to `onConnect`.
-   * @param {(profile: object, protocolVersion: number) => {host: string, port: number}|null} handler
+   * @param {(profile: object, protocolVersion: number, serverAddress: string) => {host: string, port: number, serverAddress: string}|null} handler
    * @returns {this}
    */
   onRedirect(handler) {
@@ -213,7 +214,7 @@ export default class MCConnect {
 
   /**
    * Custom ping handler. Return `"online"` or `"pinging"`.
-   * @param {(payload: Buffer, protocolVersion: number) => "online"|"pinging"} handler
+   * @param {(payload: Buffer, protocolVersion: number, serverAddress: string) => "online"|"pinging"} handler
    * @returns {this}
    */
   onPing(handler) {
@@ -289,8 +290,9 @@ export default class MCConnect {
 
   async #handshake(packet, connection) {
     if (packet.id !== 0x00) return;
-    const { protocolVersion, nextState } = this.#parseHandshake(packet.data);
+    const { protocolVersion, serverAddress, nextState } = this.#parseHandshake(packet.data);
     connection.protocolVersion = protocolVersion;
+    connection.serverAddress = serverAddress;
     if (nextState === 1) connection.state = "status";
     else if (nextState === 2 || nextState === 3) connection.state = "login";
     else this.#disconnect(connection, "Bad handshake");
@@ -304,7 +306,7 @@ export default class MCConnect {
     offset += serverAddress.s;
     offset += 2; // port (UInt16BE)
     const nextState = VarInt.read(buffer, offset);
-    return { protocolVersion: protocolVersion.v, nextState: nextState.v };
+    return { protocolVersion: protocolVersion.v, serverAddress: serverAddress.v, nextState: nextState.v };
   }
 
   // --- Status ---
@@ -335,7 +337,7 @@ export default class MCConnect {
     let mode = this.#pingMode;
     if (this.#pingHandler) {
       try {
-        mode = this.#pingHandler(payload, connection.protocolVersion);
+        mode = this.#pingHandler(payload, connection.protocolVersion, connection.serverAddress);
       } catch (e) {
         console.error("Ping handler error:", e);
       }
@@ -343,15 +345,15 @@ export default class MCConnect {
     mode === "online"
       ? this.#send(connection, Buffer.concat([VarInt.write(0x01), payload]))
       : setTimeout(
-          () => {
-            if (!connection.socket.destroyed)
-              this.#send(
-                connection,
-                Buffer.concat([VarInt.write(0x01), Buffer.alloc(8)]),
-              );
-          },
-          3000 + Math.random() * 2000,
-        );
+        () => {
+          if (!connection.socket.destroyed)
+            this.#send(
+              connection,
+              Buffer.concat([VarInt.write(0x01), Buffer.alloc(8)]),
+            );
+        },
+        3000 + Math.random() * 2000,
+      );
   }
 
   // --- Login ---
@@ -378,20 +380,20 @@ export default class MCConnect {
     const packet =
       connection.protocolVersion > 763
         ? Buffer.concat([
-            VarInt.write(0x01),
-            PacketParser.writeString(""),
-            PacketParser.writeByteArray(this.#keys.publicKey),
-            PacketParser.writeByteArray(connection.verificationToken),
-            Buffer.from([0x01]), // should_authenticate = true
-          ])
+          VarInt.write(0x01),
+          PacketParser.writeString(""),
+          PacketParser.writeByteArray(this.#keys.publicKey),
+          PacketParser.writeByteArray(connection.verificationToken),
+          Buffer.from([0x01]), // should_authenticate = true
+        ])
         : Buffer.concat([
-            VarInt.write(0x01),
-            PacketParser.writeString(""),
-            VarInt.write(this.#keys.publicKey.length),
-            this.#keys.publicKey,
-            VarInt.write(4),
-            connection.verificationToken,
-          ]);
+          VarInt.write(0x01),
+          PacketParser.writeString(""),
+          VarInt.write(this.#keys.publicKey.length),
+          this.#keys.publicKey,
+          VarInt.write(4),
+          connection.verificationToken,
+        ]);
 
     this.#send(connection, packet);
   }
@@ -426,6 +428,7 @@ export default class MCConnect {
         const target = this.#redirectHandler(
           connection.gameProfile,
           connection.protocolVersion,
+          connection.serverAddress,
         );
         if (target?.host && typeof target.port === "number") {
           connection.redirectTarget = target;
@@ -444,6 +447,7 @@ export default class MCConnect {
         const result = this.#connectHandler(
           connection.gameProfile,
           connection.protocolVersion,
+          connection.serverAddress,
         );
         if (result != null) message = result;
       } catch (e) {
@@ -604,9 +608,9 @@ export default class MCConnect {
           code === "r"
             ? { text: "" }
             : {
-                text: "",
-                ...(COLOR_MAP[code] ? { color: COLOR_MAP[code] } : {}),
-              };
+              text: "",
+              ...(COLOR_MAP[code] ? { color: COLOR_MAP[code] } : {}),
+            };
       } else {
         current.text += string[i];
       }

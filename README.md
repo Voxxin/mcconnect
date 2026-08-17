@@ -110,7 +110,7 @@ Called after successful login and Mojang session validation. Return a text compo
 
 **Signature**
 ```js
-(profile, protocolVersion) => textComponent | void
+(profile, protocolVersion, serverAddress) => textComponent | void
 ```
 
 **Profile Object**
@@ -132,13 +132,13 @@ Called after successful authentication. If the handler returns a `{ host, port }
 
 **Signature**
 ```js
-(profile, protocolVersion) => { host: string, port: number } | null
+(profile, protocolVersion, serverAddress) => { host: string, port: number, serverAddress: string } | null
 ```
 
 **Example**
 ```javascript
-server.onRedirect((profile, protocol) => {
-  if (profile.name === "Notch") {
+server.onRedirect((profile, protocol, serverAddress) => {
+  if (profile.name === "Notch" && serverAddress === "play.example.com") {
     return { host: "vip.example.com", port: 25565 };
   }
   return null; // fall through to onConnect
